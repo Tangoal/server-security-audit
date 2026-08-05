@@ -49,10 +49,10 @@ EOF
 # décrivent le parc au même instant.
 cat > "$UNIT_DIR/$NAME.timer" <<'EOF'
 [Unit]
-Description=Lance server-security-audit.service tous les lundis à 7h00 UTC
+Description=Lance server-security-audit.service tous les lundis à 4h00 UTC
 
 [Timer]
-OnCalendar=Mon *-*-* 07:00:00 UTC
+OnCalendar=Mon *-*-* 04:00:00 UTC
 Persistent=true
 
 [Install]
