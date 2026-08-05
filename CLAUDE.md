@@ -132,12 +132,16 @@ rapports de la même semaine décrivent le parc au même instant.
   `/var/lib/containerd` et `/snap`, ils noient les vrais SUID de l'hôte.
 - **`AUDIT_DRY_RUN`** dépose le prompt complet et s'arrête avant l'appel : c'est
   l'outil de mise au point, il ne consomme rien et n'envoie rien.
-- **Resend refuse tout destinataire autre que le titulaire du compte** tant
-  qu'aucun domaine n'y est vérifié (`403 validation_error` avec l'expéditeur
-  `onboarding@resend.dev`). D'où `ALERT_EMAIL_TO=tlpcreation.dev@gmail.com`.
-  Pour écrire ailleurs : vérifier `tlpcreation.ovh` dans Resend et passer
-  `ALERT_EMAIL_FROM` sur une adresse de ce domaine. La clé en place est en
-  envoi seul — elle ne peut pas gérer les domaines par API.
+- **L'expéditeur par défaut de Resend coûte deux fois.** Avec
+  `onboarding@resend.dev` : `403 validation_error` dès qu'on écrit à quelqu'un
+  d'autre que le titulaire du compte, et remise systématique en indésirables
+  (domaine partagé, ni SPF ni DKIM au nom de l'envoyeur). Résolu le 2026-08-05
+  en vérifiant `tlpcreation.ovh` dans Resend (DKIM `resend._domainkey` + SPF
+  `send.tlpcreation.ovh` dans Cloudflare) et en passant
+  `ALERT_EMAIL_FROM=alertes@tlpcreation.ovh`.
+- **La clé Resend en place est en envoi seul** : elle est rejetée sur `/domains`
+  et sur `GET /emails/<id>`. Impossible donc de vérifier le statut de remise
+  d'un message depuis la machine — d'où la journalisation de l'id à l'envoi.
 - **Compter les 🚨 dans tout le rapport donne le double du vrai chiffre**
   (tableau de synthèse + corps de section). L'objet du mail lit la ligne
   « Bilan » que le rapport produit lui-même.
