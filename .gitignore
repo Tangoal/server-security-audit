@@ -1,0 +1,13 @@
+# Configuration locale d'un serveur : contient la clé API Resend.
+.env
+
+# Les rapports sont propres à chaque machine et portent le MÊME nom de fichier
+# (reports/<date>.md) sur toutes : les versionner garantit un conflit à chaque
+# run hebdomadaire. Ils sont déjà sauvegardés par l'archive `workspace/` du
+# backup quotidien vers Drive.
+reports/
+
+# Générées par install.sh dans /etc/systemd/system, jamais versionnées : leur
+# ExecStart dépend du chemin d'installation, donc de la machine.
+server-security-audit.service
+server-security-audit.timer
