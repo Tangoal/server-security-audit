@@ -518,7 +518,10 @@ PY
     -H "Content-Type: application/json" \
     --data-binary "@$PAYLOAD" 2>&1)" || http="000"
   if [ "$http" = "200" ]; then
-    log "rapport envoyé à $ALERT_EMAIL_TO (HTTP 200)"
+    # L'identifiant Resend est journalisé : HTTP 200 signifie « accepté », pas
+    # « délivré ». Quand un mail manque à l'arrivée, c'est le seul élément qui
+    # permet de trancher entre un envoi jamais parti et une remise en spam.
+    log "rapport envoyé à $ALERT_EMAIL_TO (HTTP 200, id $(python3 -c 'import json,sys;print(json.load(sys.stdin).get("id","?"))' < "$response" 2>/dev/null || echo '?'))"
     rm -f "$response"
     return 0
   fi
