@@ -49,11 +49,31 @@ Ne pas ajouter de relevé qui lise le contenu d'un fichier sensible.
 | Fichier | Rôle |
 |---|---|
 | `audit.sh` | Tout le pipeline. Aucun nom de machine en dur. |
+| `install.sh` | Génère et active l'unité + le timer sur la machine courante. |
 | `.env` | Config locale de CE serveur (jamais commité, `chmod 600`). |
 | `.env.example` | Modèle documenté. |
-| `server-security-audit.service` | Unité systemd (`User=root`, `ExecStart` à adapter). |
-| `server-security-audit.timer` | Lundi 07h00 UTC, `Persistent=true`. |
-| `reports/<date>.md` | Rapports produits. |
+| `reports/<date>.md` | Rapports produits (jamais commités). |
+
+## Dépôt partagé entre serveurs
+
+Le code vit dans le dépôt **privé** `Tangoal/server-security-audit`, cloné sur
+chaque machine. Trois choses n'y sont volontairement pas :
+
+- **`.env`** — il contient la clé Resend.
+- **`reports/`** — toutes les machines écrivent `reports/<date>.md`, le même
+  chemin : les versionner garantit un conflit chaque lundi. Ils sont déjà
+  sauvegardés par l'archive `workspace/` du backup quotidien.
+- **Les unités systemd** — leur `ExecStart` dépend du chemin d'installation,
+  donc de la machine. `install.sh` les génère dans `/etc/systemd/system` à
+  partir de son propre emplacement ; les versionner ferait écraser le chemin
+  d'un serveur par celui de l'autre à chaque `git pull`.
+
+Mettre à jour un serveur : `git pull && sudo ./install.sh`.
+
+Les machines qui n'ont pas à pousser utilisent une **clé de déploiement en
+lecture seule** (`~/.ssh/id_github_deploy` + entrée `Host github.com` dans
+`~/.ssh/config`), pas un token de compte : un serveur compromis ne doit pas
+pouvoir réécrire le code d'audit des autres.
 
 ## Pourquoi le service tourne en root
 

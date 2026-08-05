@@ -23,32 +23,34 @@ Ancien script `maintenance/audit-secu/vps-audit-secu.sh` retrouvé (rien n'a ét
 - Si `RESEND_API_KEY` n'est pas encore configuré au moment du premier run réel, s'arrêter plutôt que de laisser échouer l'envoi en silence.
 
 ## Statut
-**Déployé et actif sur les deux machines — 2026-08-05**
+**Atteint — 2026-08-05**
 
 | Vérification | `ghost` | VPS |
 |---|---|---|
-| Run manuel de `audit.sh` réussi | ✅ | ✅ |
-| Rapport `reports/2026-08-05.md` structuré (9 domaines) | ✅ | ✅ |
-| Mail Resend reçu | ✅ HTTP 200 | ✅ HTTP 200 |
+| Run du service en root réussi (`Result=success`, code 0) | ✅ | ✅ |
+| Rapport `reports/2026-08-05.md`, 9 domaines, 0 « non vérifié » | ✅ 23 Ko | ✅ 10 Ko |
+| Mail Resend envoyé | ✅ HTTP 200 | ✅ HTTP 200 |
 | Timer actif lundi 07h00 UTC | ✅ | ✅ |
-| Run du service en root | ✅ | ⏳ voir ci-dessous |
 
-- `grep -riE "<nom de machine>" audit.sh` : aucune occurrence, script identique
-  au md5 près sur les deux machines, seuls les `.env` diffèrent.
+- `grep -riE "<nom de machine>" audit.sh` : aucune occurrence. Script identique
+  au md5 près sur les deux machines (`b85f4b94…`), seuls les `.env` diffèrent.
 - Inclusion du rapport dans l'archive `workspace.tar.gz` vérifiée en rejouant les
   exclusions du backup quotidien (pas d'attente du run de 3h nécessaire).
-- Sur le VPS, le run de validation a tourné sous l'utilisateur `ubuntu` (le
-  `sudo` y demande un mot de passe) : le rapport marque donc `🔍 Non vérifié`
-  sur le pare-feu et les mises à jour, et ne conclut aucun ✅ sur une section
-  non collectée — le comportement dégradé attendu. Le service systemd, lui,
-  tourne en root : le premier run complet sur le VPS aura lieu au déclenchement
-  du timer, lundi 10 août 07h00 UTC, ou plus tôt via
-  `sudo systemctl start server-security-audit.service`.
+- Le run dégradé (sans root) a aussi été éprouvé sur le VPS : il marque
+  `🔍 Non vérifié` sur le pare-feu et les mises à jour et ne conclut jamais ✅
+  sur une section non collectée.
 
-Le rapport dégradé du VPS a malgré tout relevé : 25 156 échecs SSH en 7 jours
-sans `fail2ban` installé, `umami-db` publiant Postgres sur `5432/tcp`, et deux
-`.env` lisibles par tous. Rien n'a été corrigé — l'audit constate, il ne répare
-pas (hors périmètre assumé).
+Ajout non prévu au périmètre initial, décidé en cours de route : le code vit
+dans le dépôt privé `Tangoal/server-security-audit`, et `install.sh` génère
+l'unité systemd depuis son propre chemin — sans quoi un `git pull` écrasait
+l'`ExecStart` d'un serveur par celui de l'autre. Le VPS tire via une clé de
+déploiement en lecture seule, pas un token de compte.
+
+Premières conclusions des audits (rien n'a été corrigé — l'audit constate) :
+`ghost` a 7 fichiers de secrets en `o+r` et `markup/{docs,src}` en `0707` alors
+que le conteneur `markup`, public, monte `/home/tangoal` en écriture ; le VPS a
+deux `.env` lisibles par tous, 25 158 échecs SSH en 7 jours, et `dockhand` avec
+le socket Docker en écriture.
 
 Décision d'exploitation : la clé Resend fournie est en **envoi seul** et le
 compte n'a **aucun domaine vérifié**, donc `onboarding@resend.dev` ne peut
