@@ -96,21 +96,27 @@ mais un rapport « PARTIEL » ne doit pas être lu comme un feu vert.
 ## Installer sur un nouveau serveur
 
 ```bash
-# 1. Poser le dossier (le script est identique partout)
-scp audit.sh .env.example *.service *.timer serveur:~/workspace/infra/server-security-audit/
+# 1. Cloner le dépôt (clé de déploiement en lecture seule, cf. plus haut)
+git clone git@github.com:Tangoal/server-security-audit.git \
+  ~/workspace/infra/server-security-audit && cd $_
 
 # 2. Config locale
-cp .env.example .env && chmod 600 .env   # puis remplir CLAUDE_BIN, CLAUDE_RUN_AS,
-                                         # CONTEXT_FILES, SENSITIVE_PATHS, Resend
+cp .env.example .env && chmod 600 .env   # puis remplir SERVER_LABEL, CLAUDE_BIN,
+                                         # CLAUDE_RUN_AS, CONTEXT_FILES,
+                                         # SENSITIVE_PATHS, Resend
 
-# 3. Vérifier la collecte sans rien appeler ni envoyer
+# 3. Vérifier la collecte sans appeler claude ni envoyer de mail
 AUDIT_DRY_RUN=/tmp/prompt.txt ./audit.sh && less /tmp/prompt.txt
 
-# 4. Unité + timer (adapter ExecStart au chemin de la machine)
-sudo cp server-security-audit.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now server-security-audit.timer
-systemctl list-timers server-security-audit.timer
+# 4. Unité + timer, générés depuis le chemin réel du dossier
+sudo ./install.sh
+
+# 5. Premier run complet (facultatif, sinon le timer s'en charge lundi)
+sudo systemctl start server-security-audit.service
 ```
+
+La session `claude` doit être authentifiée **pour l'utilisateur `CLAUDE_RUN_AS`**
+sur la machine : lancer `claude` une fois en interactif avant le premier run.
 
 L'horaire est **le même sur tous les serveurs** (lundi 07h00 UTC) : deux
 rapports de la même semaine décrivent le parc au même instant.
