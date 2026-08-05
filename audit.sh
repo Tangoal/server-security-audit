@@ -480,14 +480,17 @@ else
   CRIT="$(grep -c '🚨' "$REPORT" || true)"
   WARN="$(grep -c '⚠️' "$REPORT" || true)"
 fi
+# Le libellé du serveur ouvre l'objet : c'est la première chose lue dans une
+# liste de messages, et c'est elle qui permet de filtrer par machine côté client
+# mail quand le parc grandit.
 if [ "$STATUS" != "ok" ]; then
-  SUBJECT="[audit-secu] $SERVER_LABEL — $DATE — ÉCHEC DE L'AUDIT"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — ÉCHEC DE L'AUDIT"
 elif [ "$CRIT" -gt 0 ]; then
-  SUBJECT="[audit-secu] $SERVER_LABEL — $DATE — $CRIT point(s) critique(s), $WARN alerte(s)"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — $CRIT point(s) critique(s), $WARN alerte(s)"
 elif [ "$WARN" -gt 0 ]; then
-  SUBJECT="[audit-secu] $SERVER_LABEL — $DATE — $WARN alerte(s)"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — $WARN alerte(s)"
 else
-  SUBJECT="[audit-secu] $SERVER_LABEL — $DATE — RAS"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — RAS"
 fi
 
 send_report() {
