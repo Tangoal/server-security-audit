@@ -7,12 +7,16 @@ Audit de sécurité hebdomadaire d'un serveur, rédigé par `claude -p` en headl
 
 `audit.sh` fait trois choses, dans cet ordre :
 
-1. **Collecte** une trentaine de relevés en lecture seule (SSH, pare-feu, ports,
-   comptes et groupes, journaux d'authentification, mises à jour, cron, SUID,
-   permissions des secrets). Aucune commande ne modifie quoi que ce soit.
+1. **Collecte** une quarantaine de relevés en lecture seule (SSH, pare-feu,
+   exposition publique via tunnel et Traefik, ports, comptes et groupes,
+   journaux d'authentification et élévations de privilèges, mises à jour et
+   noyau, cron, SUID, permissions des secrets, intégrité système). Aucune
+   commande ne modifie quoi que ce soit.
 2. **Analyse** : ces faits partent dans un seul appel `claude -p … --output-format text`,
    avec une checklist de mise en forme et, s'ils existent sur la machine, les
-   documents de contexte listés dans `CONTEXT_FILES`.
+   documents de contexte listés dans `CONTEXT_FILES`. L'appel est verrouillé —
+   modèle épinglé, aucun outil, aucun serveur MCP — pour que deux runs soient
+   comparables.
 3. **Publie** : rapport dans `reports/<date>.md`, puis mail du rapport intégral
    à `ALERT_EMAIL_TO`.
 
@@ -43,6 +47,29 @@ documentation produit un audit valable, juste plus sévère.
 des modes et des empreintes — jamais sur le contenu d'un `.env`, d'une clé ou
 d'un token. Le prompt et le mail ne contiennent donc rien de confidentiel.
 Ne pas ajouter de relevé qui lise le contenu d'un fichier sensible.
+
+Deux relevés lisent malgré tout dans des fichiers de configuration, et le font
+par **liste blanche** : la configuration dynamique de Traefik n'affiche que les
+clés de structure et une poignée de clés sûres (`rule`, `entrypoints`,
+`middlewares`…), parce que ces fichiers portent les empreintes `basicAuth` ; le
+tunnel Cloudflare n'affiche que les `hostname`/`service`, jamais son fichier de
+credentials `<uuid>.json`. Une liste noire ne conviendrait pas ici : elle
+laisse passer ce qu'on n'a pas prévu.
+
+**Le pare-feu ne décrit pas la surface publique.** Sur une machine derrière un
+tunnel Cloudflare, `ufw` peut légitimement tout refuser en entrée pendant que
+vingt hostnames sont publiés vers Traefik. D'où la section 3 du rapport, qui
+croise les hostnames du tunnel avec les routers Traefik et repère ceux qui sont
+exposés sans middleware d'authentification. Sans elle, l'audit concluait « ✅
+pare-feu cohérent » sur une machine dont toute la surface d'attaque réelle
+était ailleurs.
+
+**Le rapport se termine par un marqueur machine-lisible.** La dernière ligne
+demandée est `AUDIT_SUMMARY crit=N warn=N unverified=N`. Le script s'en sert
+pour deux choses : le décompte de l'objet du mail (champs nommés, pas une regex
+sur de la prose), et la **preuve que la réponse est complète** — un rapport
+coupé aux deux tiers ne contient aucun 🚨 et partirait avec un objet « RAS ».
+Le marqueur est retiré du rapport publié.
 
 ## Fichiers
 
@@ -149,8 +176,26 @@ rapports de la même semaine décrivent le parc au même instant.
   et sur `GET /emails/<id>`. Impossible donc de vérifier le statut de remise
   d'un message depuis la machine — d'où la journalisation de l'id à l'envoi.
 - **Compter les 🚨 dans tout le rapport donne le double du vrai chiffre**
-  (tableau de synthèse + corps de section). L'objet du mail lit la ligne
-  « Bilan » que le rapport produit lui-même.
+  (tableau de synthèse + corps de section). L'objet du mail lit le marqueur
+  `AUDIT_SUMMARY`, avec repli sur la ligne « Bilan » puis sur le comptage brut
+  — dans cet ordre, jamais l'inverse : le comptage brut surestime, ce qui est
+  préférable à un « RAS » mensonger.
+- **Une troncature silencieuse fait conclure sur des données amputées.** Chaque
+  relevé est plafonné à 20 000 octets, et la coupure est désormais écrite dans
+  le bloc : un relevé coupé au milieu ressemble en tout point à un relevé
+  complet.
+- **`sudo` recopie la ligne de commande complète dans le journal**, prompt
+  compris. Le relevé des élévations de privilèges coupe donc chaque ligne de
+  journal à 200 caractères : sans ça, une invocation précédente du script
+  réinjectait des dizaines de milliers de caractères dans le prompt suivant.
+- **Chercher « token » ou « credentials » dans un chemin ne cherche pas des
+  secrets.** La première version du relevé des secrets versionnés remontait une
+  migration `add_token_version.sql` et une doc `ask-before-credentials.md` :
+  trois faux positifs sur quatre résultats, et une liste bruitée cesse d'être
+  lue. Le motif porte sur le **nom de fichier** seul.
+- **Ne pas laisser `AUDIT_MODEL` vide.** Ce serait le modèle de la session
+  interactive de `CLAUDE_RUN_AS` : un `/model` un soir changerait la rigueur de
+  l'audit du lundi sans que rien ne le signale.
 
 ## Vérifier que ça marche
 

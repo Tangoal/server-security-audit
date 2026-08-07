@@ -24,6 +24,20 @@ if [ ! -f "$SCRIPT_DIR/.env" ]; then
   exit 1
 fi
 
+# Le .env porte la clé d'API Resend. La documentation exige `chmod 600` depuis
+# le début, mais rien ne le vérifiait : un .env laissé en 644 par un `cp` est
+# lisible par tout compte de la machine, y compris depuis un conteneur qui
+# monterait le dossier. On refuse plutôt que de corriger en silence : le fichier
+# a peut-être aussi déjà été lu.
+ENV_MODE="$(stat -c '%a' "$SCRIPT_DIR/.env")"
+if [ "$ENV_MODE" != "600" ] && [ "$ENV_MODE" != "400" ]; then
+  echo "ERREUR: $SCRIPT_DIR/.env est en mode $ENV_MODE (attendu 600)." >&2
+  echo "Il contient la clé Resend. Corriger, puis relancer :" >&2
+  echo "  chmod 600 $SCRIPT_DIR/.env" >&2
+  echo "Si le fichier a pu être lu par un autre compte, révoquer la clé sur resend.com." >&2
+  exit 1
+fi
+
 if [ ! -x "$SCRIPT_DIR/audit.sh" ]; then
   chmod +x "$SCRIPT_DIR/audit.sh"
 fi

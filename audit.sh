@@ -45,9 +45,15 @@ SERVER_LABEL="${SERVER_LABEL:-$(hostname -s)}"
 REPORTS_DIR="${REPORTS_DIR:-$SCRIPT_DIR/reports}"
 REPORT_RETENTION="${REPORT_RETENTION:-60}"
 AUDIT_TIMEOUT="${AUDIT_TIMEOUT:-900}"
-AUDIT_MODEL="${AUDIT_MODEL:-}"
+# Modèle épinglé sur un identifiant complet, pas un alias : l'alias glisse d'une
+# version à l'autre, et la rigueur de l'audit changerait sans que rien ne le
+# signale. Laisser vide n'est PAS neutre — ce serait le modèle configuré dans la
+# session interactive de CLAUDE_RUN_AS, donc un `/model` un soir change l'audit
+# du lundi. Surchargeable dans le .env, jamais implicite.
+AUDIT_MODEL="${AUDIT_MODEL:-claude-opus-5}"
 CONTEXT_FILES="${CONTEXT_FILES:-}"
 SENSITIVE_PATHS="${SENSITIVE_PATHS:-}"
+CLOUDFLARED_CONFIG="${CLOUDFLARED_CONFIG:-/etc/cloudflared/config.yml}"
 RESEND_API_KEY="${RESEND_API_KEY:-}"
 ALERT_EMAIL_TO="${ALERT_EMAIL_TO:-}"
 ALERT_EMAIL_FROM="${ALERT_EMAIL_FROM:-onboarding@resend.dev}"
@@ -98,19 +104,35 @@ FACTS="$(mktemp)"
 PROMPT_FILE="$(mktemp)"
 PAYLOAD="$(mktemp)"
 RAW_OUTPUT="$(mktemp)"
-cleanup() { rm -f "$FACTS" "$PROMPT_FILE" "$PAYLOAD" "$RAW_OUTPUT"; }
+# `$RAW_OUTPUT.err` est listé ici aussi : il n'était supprimé que sur le chemin
+# nominal, et restait dans /tmp à chaque interruption avant la fin.
+cleanup() { rm -f "$FACTS" "$PROMPT_FILE" "$PAYLOAD" "$RAW_OUTPUT" "$RAW_OUTPUT.err"; }
 trap cleanup EXIT
 
 # sec <titre> <commande...> — exécute la commande et range sa sortie dans un
 # bloc de code titré. Une commande absente ou refusée n'interrompt jamais la
 # collecte : elle laisse une trace explicite dans les faits.
+#
+# La troncature est ANNONCÉE dans le bloc. Couper à 20 000 octets en silence
+# faisait conclure l'analyse sur des données amputées sans qu'elle puisse le
+# savoir : un relevé coupé au milieu ressemble à un relevé complet.
+SEC_MAX_BYTES=20000
 sec() {
   local title="$1"; shift
+  local buf size
+  buf="$(mktemp)"
+  "$@" > "$buf" 2>&1
+  size="$(wc -c < "$buf")"
   {
     printf '\n### %s\n```\n' "$title"
-    "$@" 2>&1 | head -c 20000
+    head -c "$SEC_MAX_BYTES" "$buf"
+    if [ "$size" -gt "$SEC_MAX_BYTES" ]; then
+      printf '\n[… RELEVÉ TRONQUÉ : %s octets sur %s. Les faits manquants ne valent pas absence de problème.]\n' \
+        "$SEC_MAX_BYTES" "$size"
+    fi
     printf '```\n'
   } >> "$FACTS"
+  rm -f "$buf"
 }
 
 # Idem pour un enchaînement de commandes shell (pipes, boucles).
@@ -184,6 +206,76 @@ secsh "Pare-feu — chaîne DOCKER-USER (contournement de ufw par Docker)" \
 secsh "Pare-feu — redirections NAT publiées par Docker" \
   "$SUDO iptables -t nat -S DOCKER 2>&1 | head -n 60 || echo '(permission refusée)'"
 
+# --- Exposition publique réelle --------------------------------------------
+# Le pare-feu ne dit PAS ce qui est exposé sur Internet. Sur une machine
+# derrière un tunnel Cloudflare, ufw peut légitimement tout refuser en entrée
+# pendant que vingt hostnames sont publiés vers Traefik : la surface publique
+# est décrite par la configuration du tunnel et par les routers Traefik, pas
+# par iptables. Sans ces relevés, un ingress ajouté sans authentification est
+# invisible pour l'audit.
+#
+# Aucun secret ne sort : on lit les hostnames et les cibles, jamais le fichier
+# de credentials du tunnel (`<uuid>.json`), et le contenu de la configuration
+# dynamique de Traefik est filtré par liste blanche (voir plus bas).
+secsh "Exposition — dossier cloudflared (modes, fichiers résiduels)" \
+  "[ -d \"\$(dirname '$CLOUDFLARED_CONFIG')\" ] \
+     && $SUDO ls -l \"\$(dirname '$CLOUDFLARED_CONFIG')\" 2>&1 \
+     || echo '(cloudflared absent de cette machine)'"
+
+secsh "Exposition — hostnames publiés par le tunnel Cloudflare" \
+  "if [ -f '$CLOUDFLARED_CONFIG' ]; then
+     echo \"--- $CLOUDFLARED_CONFIG (\$($SUDO stat -c '%a %U:%G' '$CLOUDFLARED_CONFIG' 2>/dev/null)) ---\"
+     $SUDO grep -nE '^[[:space:]]*(-[[:space:]]*)?(hostname|service|path|originRequest|noTLSVerify|httpHostHeader|access|audTag|warp-routing|enabled):' '$CLOUDFLARED_CONFIG' 2>/dev/null
+     echo \"total : \$($SUDO grep -cE '^[[:space:]]*-?[[:space:]]*hostname:' '$CLOUDFLARED_CONFIG' 2>/dev/null) hostname(s) publié(s)\"
+   else
+     echo '(pas de configuration cloudflared : $CLOUDFLARED_CONFIG absent)'
+   fi"
+
+# Un router sans middleware est écrit explicitement « middlewares=(AUCUN) » :
+# dans un dump de labels, l'absence d'authentification ne se voit pas, elle ne
+# produit aucune ligne — et c'est précisément ce qu'il faut repérer.
+secsh "Exposition — routers Traefik déclarés par les conteneurs" \
+  "command -v docker >/dev/null 2>&1 || { echo '(docker indisponible)'; exit 0; }
+   docker ps -q 2>/dev/null | while read -r c; do
+     name=\$(docker inspect --format '{{.Name}}' \"\$c\" 2>/dev/null); name=\${name#/}
+     labels=\$(docker inspect --format '{{range \$k,\$v := .Config.Labels}}{{\$k}}={{\$v}}
+{{end}}' \"\$c\" 2>/dev/null | grep -i '^traefik')
+     [ -n \"\$labels\" ] || continue
+     echo \"--- \$name ---\"
+     echo \"\$labels\" | grep -oE '^traefik\.http\.routers\.[^.]+' | sort -u | while read -r r; do
+       rn=\${r##*.}
+       rule=\$(echo \"\$labels\" | grep -E \"^\$r\.rule=\" | cut -d= -f2-)
+       ep=\$(echo \"\$labels\" | grep -E \"^\$r\.entrypoints=\" | cut -d= -f2-)
+       mw=\$(echo \"\$labels\" | grep -E \"^\$r\.middlewares=\" | cut -d= -f2-)
+       tls=\$(echo \"\$labels\" | grep -E \"^\$r\.tls\" | head -n1 | cut -d= -f2-)
+       echo \"  router=\$rn entrypoints=\${ep:-(defaut)} middlewares=\${mw:-(AUCUN)} tls=\${tls:-(non)} rule=\${rule:-(?)}\"
+     done
+     echo \"\$labels\" | grep -E '^traefik\.http\.services\..*\.loadbalancer\.server\.port=' | sed 's/^/  /'
+     echo \"\$labels\" | grep -E '^traefik\.(enable|docker\.network)=' | sed 's/^/  /'
+   done"
+
+# Le provider « file » de Traefik définit des middlewares hors des conteneurs :
+# une authentification peut vivre là, ou en être absente. Le contenu est extrait
+# par LISTE BLANCHE (clés de structure et clés sûres) — ces fichiers portent des
+# empreintes de mots de passe basicAuth, qui ne doivent jamais quitter la
+# machine. Une ligne de valeur non listée n'est pas affichée.
+secsh "Exposition — configuration dynamique Traefik (structure seule, valeurs masquées)" \
+  "command -v docker >/dev/null 2>&1 || { echo '(docker indisponible)'; exit 0; }
+   dirs=\$(docker ps -q 2>/dev/null | while read -r c; do
+     docker inspect --format '{{range .HostConfig.Binds}}{{.}}
+{{end}}' \"\$c\" 2>/dev/null | grep -i 'traefik' | cut -d: -f1
+   done | sort -u)
+   [ -n \"\$dirs\" ] || { echo '(aucun montage Traefik depuis l hote)'; exit 0; }
+   for d in \$dirs; do
+     [ -d \"\$d\" ] || continue
+     echo \"--- \$d ---\"
+     $SUDO find \"\$d\" -maxdepth 2 -type f -printf '%M %u:%g %s octets %p\n' 2>/dev/null | head -n 20
+     $SUDO find \"\$d\" -maxdepth 2 -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.toml' \) 2>/dev/null | head -n 10 | while read -r f; do
+       echo \"    structure de \$f :\"
+       $SUDO grep -E '^[[:space:]]*[a-zA-Z0-9_.-]+:[[:space:]]*\$|^[[:space:]]*(rule|entrypoints|middlewares|service|scheme|address|permanent|insecureSkipVerify):' \"\$f\" 2>/dev/null | sed 's/^/      /'
+     done
+   done"
+
 secsh "Ports en écoute (avec processus)" \
   "$SUDO ss -tulpenH 2>/dev/null | sed 's/\s\+/ /g' | sort -k5 | head -n 80 || ss -tuln"
 
@@ -210,6 +302,25 @@ secsh "Authentification — 15 IP sources les plus insistantes (7 jours)" \
 secsh "Authentification — connexions réussies récentes" \
   "{ $SUDO journalctl -u ssh -u sshd --since '7 days ago' --no-pager 2>/dev/null | grep -i 'accepted' | tail -n 15; } ; last -n 10 2>/dev/null"
 
+# Les échecs relevés plus haut disent qui n'est PAS entré. Ce relevé-ci dit qui
+# a obtenu des privilèges, et c'est le signal qui compte : un compte créé ou un
+# sudo accordé la semaine dernière n'apparaissait nulle part dans l'audit.
+# Chaque ligne est coupée à 200 caractères. `sudo` recopie la ligne de commande
+# complète dans le journal : une seule invocation portant un gros argument (le
+# prompt d'un run précédent, par exemple) produit une ligne de dizaines de
+# milliers de caractères, qui gonflerait les faits et réinjecterait du contenu
+# arbitraire dans le prompt de l'analyse. Seul le début de la commande importe.
+secsh "Élévations de privilèges et créations de comptes (7 jours)" \
+  "logs=\$({ $SUDO journalctl --since '7 days ago' --no-pager 2>/dev/null || $SUDO cat /var/log/auth.log 2>/dev/null; } | cut -c1-200)
+   [ -n \"\$logs\" ] || { echo '(journaux inaccessibles)'; exit 0; }
+   echo \"sudo réussis : \$(echo \"\$logs\" | grep -cE 'sudo(\[[0-9]+\])?:.*COMMAND=') — 20 derniers :\"
+   echo \"\$logs\" | grep -E 'sudo(\[[0-9]+\])?:.*COMMAND=' | sed -E 's/^([A-Za-z]{3} [ 0-9]+ [0-9:]+).*sudo[^:]*: *([a-z0-9_-]+).*(COMMAND=.*)/  \1 \2 \3/' | tail -n 20
+   echo '--- bascules su vers un autre compte (10 dernières) ---'
+   echo \"\$logs\" | grep -E ' su(\[[0-9]+\])?: .*session opened' | tail -n 10 || true
+   echo '--- créations / modifications de comptes et de groupes ---'
+   echo \"\$logs\" | grep -iE '(useradd|userdel|usermod|groupadd|groupmod|gpasswd)(\[[0-9]+\])?:' | tail -n 20
+   echo '(fin)'"
+
 secsh "Authentification — fail2ban" \
   "command -v fail2ban-client >/dev/null 2>&1 && { $SUDO fail2ban-client status 2>&1; } || echo '(fail2ban non installé)'"
 
@@ -222,6 +333,15 @@ secsh "Paquets à mettre à jour (sécurité d'abord)" \
    echo \"total : \$(echo \"\$up\" | grep -c . ) paquet(s) — dont \$(echo \"\$up\" | grep -ci 'security') étiqueté(s) sécurité\"
    echo '--- sécurité ---'; echo \"\$up\" | grep -i 'security' | head -n 30
    echo '--- autres (extrait) ---'; echo \"\$up\" | grep -vi 'security' | head -n 20"
+
+# Le noyau en cours d'exécution est le seul fait qui tranche entre « correctif
+# noyau appliqué » et « correctif installé mais pas encore chargé » : un paquet
+# à jour sur le disque ne protège de rien tant que la machine n'a pas redémarré.
+secsh "Noyau — version en cours d'exécution vs noyaux installés" \
+  "echo \"en cours d execution : \$(uname -r)  (\$(uptime -p 2>/dev/null | sed 's/^up /machine démarrée depuis /'))\"
+   echo '--- noyaux installés (état ii uniquement) ---'
+   dpkg -l 'linux-image-*' 2>/dev/null | awk '\$1==\"ii\" && \$2 !~ /^linux-image-(fb-)?generic\$/ {print \$2\" \"\$3}' | sort | tail -n 6 \
+     || echo '(dpkg indisponible)'"
 
 secsh "Redémarrage requis / mises à jour automatiques" \
   "[ -f /var/run/reboot-required ] && { echo 'REDÉMARRAGE REQUIS :'; cat /var/run/reboot-required.pkgs 2>/dev/null | head -n 20; } || echo 'pas de redémarrage requis'
@@ -286,6 +406,91 @@ secsh "Répertoires accessibles en écriture par tous dans les chemins sensibles
      $SUDO find \"\$p\" -maxdepth 3 -type d -perm -o=w ! -path '*/node_modules/*' -printf '%M %u:%g %p\n' 2>/dev/null | head -n 20
    done; echo '(fin)'"
 
+# --- Secrets versionnés par erreur -----------------------------------------
+# Les permissions d'un `.env` ne protègent rien s'il est parti dans un dépôt
+# git. On interroge l'index git (`ls-files`), pas le disque : un fichier
+# ignoré correctement ne remonte pas, un fichier suivi remonte même s'il est
+# aujourd'hui absent du disque. Toujours des NOMS de fichiers, jamais le contenu.
+#
+# Le motif porte sur le NOM DE FICHIER seul, pas sur le chemin : chercher
+# « token » ou « credentials » n'importe où dans le chemin faisait remonter une
+# migration `add_token_version.sql` et une documentation
+# `ask-before-credentials.md`. Trois faux positifs sur quatre résultats, et une
+# liste bruitée cesse d'être lue.
+secsh "Secrets potentiellement versionnés dans un dépôt git" \
+  "command -v git >/dev/null 2>&1 || { echo '(git indisponible)'; exit 0; }
+   IFS=',' read -ra paths <<< \"$SENSITIVE_PATHS\"
+   for p in \"\${paths[@]}\"; do
+     p=\$(echo \"\$p\" | xargs); [ -d \"\$p\" ] || continue
+     $SUDO find \"\$p\" -maxdepth 4 -type d -name .git ! -path '*/node_modules/*' 2>/dev/null | head -n 40 | while read -r g; do
+       repo=\$(dirname \"\$g\")
+       hits=\$(git -C \"\$repo\" ls-files 2>/dev/null | awk -F/ '
+                { b = \$NF }
+                b ~ /(\.example|\.sample|\.template|\.dist|\.pub)\$/ { next }
+                b ~ /^\.env(\.[A-Za-z0-9_-]+)?\$/ ||
+                b ~ /\.(key|pem|p12|pfx|secret|keystore)\$/ ||
+                b ~ /^credentials(\.[A-Za-z]+)?\$/ ||
+                b ~ /^[A-Za-z0-9_-]*(token|secret)s?\.(json|ya?ml|txt|env)\$/ ||
+                b ~ /^id_(rsa|ed25519|ecdsa|dsa)\$/ { print }' | head -n 10)
+       [ -n \"\$hits\" ] && { echo \"--- \$repo ---\"; echo \"\$hits\" | sed 's/^/  SUIVI PAR GIT : /'; }
+     done
+   done; echo '(fin)'"
+
+# --- Intégrité de l'audit lui-même -----------------------------------------
+# Ce script tourne en root depuis un dossier qui appartient à un utilisateur
+# normal : qui peut écrire dans `audit.sh` obtient root à l'heure du timer.
+# L'audit doit donc se surveiller lui-même — un fichier modifié hors dépôt ou
+# un `.env` lisible par d'autres sont des faits au même titre que les autres.
+secsh "Intégrité du dispositif d'audit (le script tourne en root)" \
+  "echo '--- permissions ---'
+   ls -ld '$SCRIPT_DIR' '$SCRIPT_DIR/audit.sh' '$SCRIPT_DIR/install.sh' '$ENV_FILE' 2>&1 | awk '{print \$1\" \"\$3\":\"\$4\" \"\$NF}'
+   ls -l /etc/systemd/system/server-security-audit.* 2>/dev/null | awk '{print \$1\" \"\$3\":\"\$4\" \"\$NF}'
+   echo '--- état du dépôt (une modification non commitée = code root altéré) ---'
+   if git -C '$SCRIPT_DIR' rev-parse --git-dir >/dev/null 2>&1; then
+     git -C '$SCRIPT_DIR' log -1 --format='dernier commit : %h %ad %an — %s' --date=short 2>/dev/null
+     st=\$(git -C '$SCRIPT_DIR' status --porcelain 2>/dev/null | grep -vE '^\?\? reports/')
+     [ -n \"\$st\" ] && { echo 'MODIFICATIONS NON COMMITÉES :'; echo \"\$st\"; } || echo 'arbre de travail propre'
+   else
+     echo '(pas un dépôt git)'
+   fi"
+
+# --- Intégrité système et signaux d'intrusion ------------------------------
+# Quatre relevés bon marché qui répondent à « quelqu'un est-il passé ? » plutôt
+# qu'à « la configuration est-elle correcte ? ». La cadence hebdomadaire leur
+# convient : ils portent tous sur les 7 derniers jours ou sur un écart au
+# paquet d'origine.
+secsh "Intégrité — binaires divergents de leur paquet (debsums)" \
+  "command -v debsums >/dev/null 2>&1 \
+     && { $SUDO debsums -c 2>&1 | head -n 40; echo '(fin — aucune ligne au-dessus = tous les binaires conformes)'; } \
+     || echo '(debsums non installé — contrôle impossible ; sudo apt install debsums pour l activer)'"
+
+secsh "Intégrité — fichiers modifiés depuis 7 jours dans les chemins système" \
+  "for d in /etc /usr/local/bin /usr/local/sbin /usr/bin /usr/sbin /root; do
+     [ -d \"\$d\" ] || continue
+     out=\$($SUDO find \"\$d\" -xdev -type f -mtime -7 ! -path '/etc/mtab' ! -path '*/letsencrypt/*' \
+             -printf '%TY-%Tm-%Td %M %u:%g %p\n' 2>/dev/null | sort | head -n 40)
+     [ -n \"\$out\" ] && { echo \"--- \$d ---\"; echo \"\$out\"; }
+   done; echo '(fin)'"
+
+# Un exécutable supprimé du disque mais toujours en mémoire est le comportement
+# normal d'un binaire mis à jour sans redémarrage du service — et aussi la
+# signature classique d'une charge effacée après lancement. Le distinguo se
+# fait sur le nom : c'est à l'analyse de trancher, pas à la collecte.
+secsh "Intégrité — processus dont l'exécutable a été supprimé du disque" \
+  "$SUDO ls -l /proc/*/exe 2>/dev/null | grep -i '(deleted)' \
+     | sed -E 's#.*/proc/([0-9]+)/exe -> #pid \1 -> #' | head -n 30
+   echo '(fin)'"
+
+secsh "Intégrité — modules noyau chargés hors arborescence de la distribution" \
+  "$SUDO lsmod 2>/dev/null | tail -n +2 | awk '{print \$1}' | while read -r m; do
+     p=\$($SUDO modinfo -n \"\$m\" 2>/dev/null)
+     case \"\$p\" in
+       /lib/modules/*|/usr/lib/modules/*|'') ;;
+       *) echo \"\$m -> \$p\" ;;
+     esac
+   done | head -n 20
+   echo \"modules chargés : \$($SUDO lsmod 2>/dev/null | tail -n +2 | wc -l) — aucune ligne au-dessus = tous issus de la distribution\""
+
 FACTS_SIZE="$(wc -c < "$FACTS")"
 log "faits collectés : $FACTS_SIZE octets"
 
@@ -327,14 +532,16 @@ checklist ci-dessous, dans l'ordre. Statuts possibles : ✅ OK, ⚠️ À corrig
 Puis une ligne « **Bilan : N critique(s), N alerte(s), N non vérifié(s).** »
 
 ## 1. SSH
-## 2. Pare-feu et exposition réseau
-## 3. Ports en écoute et conteneurs
-## 4. Comptes et groupes à risque
-## 5. Authentification et brute-force
-## 6. Mises à jour de sécurité
-## 7. Tâches planifiées
-## 8. Fichiers SUID/SGID
-## 9. Permissions des fichiers sensibles
+## 2. Pare-feu et filtrage réseau
+## 3. Exposition publique (tunnel Cloudflare et Traefik)
+## 4. Ports en écoute et conteneurs
+## 5. Comptes et groupes à risque
+## 6. Authentification, élévations de privilèges et brute-force
+## 7. Mises à jour de sécurité
+## 8. Tâches planifiées
+## 9. Fichiers SUID/SGID
+## 10. Permissions et exposition des secrets
+## 11. Intégrité système et signaux d'intrusion
 
 Dans chaque section : le statut, ce qui a été constaté (chiffres et valeurs
 exactes tirés des faits), puis pour chaque problème le risque en une ou deux
@@ -342,9 +549,37 @@ phrases et un bloc ```bash``` avec la commande exacte de correction. Si une
 section est saine, une ou deux phrases suffisent — mais indique quand même les
 valeurs clés constatées, le rapport sert aussi de photo de l'état du serveur.
 
+Précisions sur trois sections :
+- Section 3 : un pare-feu qui refuse tout en entrée ne prouve RIEN sur la
+  surface publique quand la machine est derrière un tunnel. Croise les
+  hostnames publiés par le tunnel avec les routers Traefik : signale les
+  hostnames publiés qui ne correspondent à aucun router, les routers dont la
+  règle ne correspond à aucun hostname publié, et surtout tout router exposé
+  sans middleware d'authentification (`middlewares=(AUCUN)`) donnant accès à
+  une interface d'administration, une base ou un service interne.
+- Section 10 : couvre à la fois les permissions des fichiers sensibles, les
+  secrets suivis par git, et l'intégrité du dispositif d'audit lui-même (le
+  script tourne en root : un fichier modifiable par d'autres, ou une
+  modification non commitée, est un problème de sécurité en soi).
+- Section 11 : distingue ce qui est attendu (binaire mis à jour sans
+  redémarrage du service, fichier de configuration édité récemment et cohérent
+  avec les autres faits) de ce qui ne l'est pas. Un contrôle indisponible
+  (debsums absent) est 🔍 Non vérifié, jamais ✅.
+
 ## Priorités
 Liste ordonnée des actions à mener, la plus urgente d'abord. Si rien n'est à
 faire, écris « Aucune action requise. ».
+
+Enfin, TERMINE ta réponse par ce bloc, seul sur ses lignes, sans rien après —
+il est lu par un script, pas par un humain, et son absence fait considérer le
+rapport comme tronqué :
+
+```
+AUDIT_SUMMARY crit=<nombre> warn=<nombre> unverified=<nombre>
+```
+
+Les trois nombres doivent être ceux du tableau de synthèse, comptés une seule
+fois chacun.
 PROMPT_HEAD
 
   if [ -n "$CONTEXT_FILES" ]; then
@@ -412,9 +647,14 @@ else
     fi
     log "appel de claude sous l'identité $CLAUDE_RUN_AS (HOME=$RUN_HOME)"
   fi
-  CLAUDE_ARGS=(-p "$(cat "$PROMPT_FILE")" --output-format text)
-  [ -n "$AUDIT_MODEL" ] && CLAUDE_ARGS+=(--model "$AUDIT_MODEL")
-  log "analyse via $CLAUDE (timeout ${AUDIT_TIMEOUT}s)..."
+  # Le prompt DEMANDE de n'utiliser aucun outil ; ces deux options le rendent
+  # impossible plutôt que souhaitable. `--allowed-tools ''` retire tous les
+  # outils, `--strict-mcp-config` sans `--mcp-config` empêche le chargement des
+  # serveurs MCP de l'utilisateur — ils coûteraient du contexte à chaque run et
+  # rendraient l'analyse dépendante de la configuration interactive du moment.
+  CLAUDE_ARGS=(-p "$(cat "$PROMPT_FILE")" --output-format text
+               --model "$AUDIT_MODEL" --allowed-tools '' --strict-mcp-config)
+  log "analyse via $CLAUDE (modèle $AUDIT_MODEL, timeout ${AUDIT_TIMEOUT}s)..."
   if timeout "$AUDIT_TIMEOUT" "${CLAUDE_CMD[@]}" "${CLAUDE_ARGS[@]}" > "$RAW_OUTPUT" 2>>"$RAW_OUTPUT.err"; then
     :
   else
@@ -427,16 +667,42 @@ else
     STATUS="fail"
     FAILURE="réponse de claude trop courte ($(wc -c < "$RAW_OUTPUT") octets) — rapport probablement tronqué"
   fi
+  # Le trailer AUDIT_SUMMARY est le dernier élément demandé : son absence
+  # signifie que la réponse s'est arrêtée avant la fin. Sans ce contrôle, un
+  # rapport coupé aux deux tiers ne contient aucun 🚨 et part avec un objet
+  # « RAS » — le pire résultat possible pour un audit.
+  if [ "$STATUS" = "ok" ] && ! grep -q '^AUDIT_SUMMARY ' "$RAW_OUTPUT"; then
+    STATUS="fail"
+    FAILURE="marqueur de fin AUDIT_SUMMARY absent — rapport incomplet, aucune conclusion exploitable"
+  fi
+  # Contrôle secondaire de forme : les 11 sections plus la synthèse et les
+  # priorités. Un rapport hors format reste publié, mais il est signalé.
+  SECTIONS_FOUND="$(grep -c '^## ' "$RAW_OUTPUT" || true)"
+  if [ "$STATUS" = "ok" ] && [ "$SECTIONS_FOUND" -lt 13 ]; then
+    log "ATTENTION: rapport hors format attendu ($SECTIONS_FOUND titres de niveau 2 sur 13 attendus)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
 # Rapport
 # ---------------------------------------------------------------------------
+# Le trailer AUDIT_SUMMARY a joué son rôle (preuve de complétude et décompte) :
+# il est retiré du rapport publié, avec le bloc de code qui l'entoure et les
+# lignes vides résiduelles. Le lecteur humain a déjà la ligne « Bilan » dans la
+# synthèse ; deux formulations du même chiffre dans un même document finiraient
+# par diverger.
+strip_trailer() {
+  awk '/^AUDIT_SUMMARY /{exit} {print}' "$1" \
+    | awk '{l[n++]=$0}
+           END{while(n>0 && (l[n-1] ~ /^[[:space:]]*$/ || l[n-1] ~ /^```[[:space:]]*$/)) n--;
+               for(i=0;i<n;i++) print l[i]}'
+}
+
 {
   printf '<!-- généré par infra/server-security-audit/audit.sh le %s -->\n' "$(date -u '+%Y-%m-%d %H:%M UTC')"
-  printf '<!-- serveur : %s · privilèges : %s -->\n\n' "$SERVER_LABEL" "$PRIV_NOTE"
+  printf '<!-- serveur : %s · privilèges : %s · modèle : %s -->\n\n' "$SERVER_LABEL" "$PRIV_NOTE" "$AUDIT_MODEL"
   if [ "$STATUS" = "ok" ]; then
-    cat "$RAW_OUTPUT"
+    strip_trailer "$RAW_OUTPUT"
   else
     printf '# Audit de sécurité — %s — %s\n\n## 🚨 L\x27audit n\x27a pas abouti\n\n' "$SERVER_LABEL" "$DATE"
     printf '**Cause :** %s\n\n' "$FAILURE"
@@ -465,21 +731,27 @@ find "$REPORTS_DIR" -maxdepth 1 -name '*.md' -type f -mtime "+$REPORT_RETENTION"
 # ---------------------------------------------------------------------------
 # Le mail part quel que soit le verdict : il vaut aussi bilan de bonne santé de
 # l'audit. Pas de mail le lundi = quelque chose ne tourne plus.
-# Le décompte vient de la ligne « Bilan » que le rapport produit lui-même :
-# compter les symboles dans tout le fichier les additionne deux fois (tableau
-# de synthèse + corps de section) et annonçait des chiffres faux dans l'objet.
+# Décompte, par ordre de fiabilité décroissante :
+#   1. le trailer AUDIT_SUMMARY — champs nommés, un seul format possible ;
+#   2. la ligne « Bilan » en prose — une regex sur du texte libre, ça se déforme ;
+#   3. le comptage brut des symboles, qui SURESTIME (tableau de synthèse +
+#      corps de section comptent chaque problème deux fois) mais ne peut pas
+#      annoncer « RAS » à tort. Dans cet ordre, jamais l'inverse.
 CRIT=0
 WARN=0
+SUMMARY_LINE="$(grep -m1 '^AUDIT_SUMMARY ' "$RAW_OUTPUT" 2>/dev/null || true)"
 BILAN="$(grep -m1 -o 'Bilan *: *[0-9]* critique[^,]*, *[0-9]* alerte[^,]*' "$REPORT" || true)"
-if [ -n "$BILAN" ]; then
+if [ -n "$SUMMARY_LINE" ]; then
+  CRIT="$(echo "$SUMMARY_LINE" | grep -oE 'crit=[0-9]+' | cut -d= -f2)"
+  WARN="$(echo "$SUMMARY_LINE" | grep -oE 'warn=[0-9]+' | cut -d= -f2)"
+elif [ -n "$BILAN" ]; then
   CRIT="$(echo "$BILAN" | grep -oE '[0-9]+ critique' | grep -oE '^[0-9]+')"
   WARN="$(echo "$BILAN" | grep -oE '[0-9]+ alerte' | grep -oE '^[0-9]+')"
 else
-  # Rapport hors format attendu : on retombe sur un comptage brut, quitte à
-  # surestimer — mieux vaut un objet trop alarmant qu'un « RAS » mensonger.
   CRIT="$(grep -c '🚨' "$REPORT" || true)"
   WARN="$(grep -c '⚠️' "$REPORT" || true)"
 fi
+CRIT="${CRIT:-0}"; WARN="${WARN:-0}"
 # Le libellé du serveur ouvre l'objet : c'est la première chose lue dans une
 # liste de messages, et c'est elle qui permet de filtrer par machine côté client
 # mail quand le parc grandit.
