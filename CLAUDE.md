@@ -145,8 +145,9 @@ sudo systemctl start server-security-audit.service
 La session `claude` doit être authentifiée **pour l'utilisateur `CLAUDE_RUN_AS`**
 sur la machine : lancer `claude` une fois en interactif avant le premier run.
 
-L'horaire est **le même sur tous les serveurs** (lundi 07h00 UTC) : deux
-rapports de la même semaine décrivent le parc au même instant.
+L'horaire est **le même sur tous les serveurs** (lundi 04h00 UTC, cf. le timer
+généré par `install.sh`) : deux rapports de la même semaine décrivent le parc
+au même instant.
 
 ## Pièges rencontrés
 
