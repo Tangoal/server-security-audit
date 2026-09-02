@@ -754,16 +754,17 @@ fi
 CRIT="${CRIT:-0}"; WARN="${WARN:-0}"
 # Le libellé du serveur ouvre l'objet : c'est la première chose lue dans une
 # liste de messages, et c'est elle qui permet de filtrer par machine côté client
-# mail quand le parc grandit. L'emoji final donne le verdict d'un coup d'œil,
-# sans avoir à lire la fin de l'objet — souvent tronquée sur mobile.
+# mail quand le parc grandit. Le verdict suit dans sa propre paire de crochets,
+# emoji en tête : il se lit avant la date, sans dépendre de la fin de l'objet —
+# souvent tronquée sur mobile.
 if [ "$STATUS" != "ok" ]; then
-  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — ÉCHEC DE L'AUDIT ❌"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] [❌ ÉCHEC DE L'AUDIT] — $DATE"
 elif [ "$CRIT" -gt 0 ]; then
-  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — $CRIT point(s) critique(s), $WARN alerte(s) 🚨"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] [🚨 Critiques ($CRIT), alertes ($WARN)] — $DATE"
 elif [ "$WARN" -gt 0 ]; then
-  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — $WARN alerte(s) ⚠️"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] [⚠️ Alertes ($WARN)] — $DATE"
 else
-  SUBJECT="[$SERVER_LABEL] [Audit-secu] — $DATE — RAS ✅"
+  SUBJECT="[$SERVER_LABEL] [Audit-secu] [✅ RAS] — $DATE"
 fi
 
 send_report() {
