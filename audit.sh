@@ -24,6 +24,11 @@ umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${AUDIT_ENV_FILE:-$SCRIPT_DIR/.env}"
+# Depuis install.sh (2026-09-21), le script tourne déployé hors du dépôt
+# (root-only) : SCRIPT_DIR n'est donc plus le dépôt git. AUDIT_SOURCE_DIR
+# pointe vers le clone source, pour que le self-check d'intégrité plus bas
+# puisse comparer la copie déployée à ce qu'il y a réellement dans git.
+AUDIT_SOURCE_DIR="${AUDIT_SOURCE_DIR:-$SCRIPT_DIR}"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
@@ -442,13 +447,23 @@ secsh "Secrets potentiellement versionnés dans un dépôt git" \
 # L'audit doit donc se surveiller lui-même — un fichier modifié hors dépôt ou
 # un `.env` lisible par d'autres sont des faits au même titre que les autres.
 secsh "Intégrité du dispositif d'audit (le script tourne en root)" \
-  "echo '--- permissions ---'
-   ls -ld '$SCRIPT_DIR' '$SCRIPT_DIR/audit.sh' '$SCRIPT_DIR/install.sh' '$ENV_FILE' 2>&1 | awk '{print \$1\" \"\$3\":\"\$4\" \"\$NF}'
+  "echo '--- permissions (déploiement) ---'
+   ls -ld '$SCRIPT_DIR' '$SCRIPT_DIR/audit.sh' '$ENV_FILE' 2>&1 | awk '{print \$1\" \"\$3\":\"\$4\" \"\$NF}'
    ls -l /etc/systemd/system/server-security-audit.* 2>/dev/null | awk '{print \$1\" \"\$3\":\"\$4\" \"\$NF}'
-   echo '--- état du dépôt (une modification non commitée = code root altéré) ---'
-   if git -C '$SCRIPT_DIR' rev-parse --git-dir >/dev/null 2>&1; then
-     git -C '$SCRIPT_DIR' log -1 --format='dernier commit : %h %ad %an — %s' --date=short 2>/dev/null
-     st=\$(git -C '$SCRIPT_DIR' status --porcelain 2>/dev/null | grep -vE '^\?\? reports/')
+   echo '--- copie déployée vs dépôt source ($AUDIT_SOURCE_DIR) ---'
+   if [ -f '$AUDIT_SOURCE_DIR/audit.sh' ]; then
+     if cmp -s '$SCRIPT_DIR/audit.sh' '$AUDIT_SOURCE_DIR/audit.sh'; then
+       echo 'copie déployée identique au dépôt source'
+     else
+       echo 'ATTENTION : copie déployée DIFFÉRENTE du dépôt source (relancer install.sh, ou code root altéré ?)'
+     fi
+   else
+     echo \"(dépôt source introuvable à $AUDIT_SOURCE_DIR)\"
+   fi
+   echo '--- état du dépôt source (une modification non commitée = code altéré avant sa prochaine copie) ---'
+   if git -C '$AUDIT_SOURCE_DIR' rev-parse --git-dir >/dev/null 2>&1; then
+     git -C '$AUDIT_SOURCE_DIR' log -1 --format='dernier commit : %h %ad %an — %s' --date=short 2>/dev/null
+     st=\$(git -C '$AUDIT_SOURCE_DIR' status --porcelain 2>/dev/null | grep -vE '^\?\? reports/')
      [ -n \"\$st\" ] && { echo 'MODIFICATIONS NON COMMITÉES :'; echo \"\$st\"; } || echo 'arbre de travail propre'
    else
      echo '(pas un dépôt git)'

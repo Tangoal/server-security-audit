@@ -82,6 +82,10 @@ Le marqueur est retiré du rapport publié.
 | `.env.example` | Modèle documenté. |
 | `reports/<date>.md` | Rapports produits (jamais commités). |
 
+Depuis le 2026-09-21, `install.sh` **déploie** `audit.sh`/`.env`/`reports/`
+hors du dépôt (voir § Sécurité du dispositif ci-dessous) — les chemins
+ci-dessus restent la source, pas ce qui tourne réellement.
+
 ## Dépôt partagé entre serveurs
 
 Le même code peut être cloné sur plusieurs machines. Trois choses n'y sont
@@ -121,6 +125,35 @@ Lancé à la main sans privilèges, le script ne s'arrête pas : il marque la
 collecte « PARTIEL » et le prompt interdit de conclure ✅ sur une section non
 collectée. C'est volontaire — un audit dégradé vaut mieux qu'un audit absent —
 mais un rapport « PARTIEL » ne doit pas être lu comme un feu vert.
+
+## Sécurité du dispositif (déploiement hors du dépôt)
+
+Depuis le 2026-09-21, `install.sh` ne pointe plus l'unité systemd vers le
+dépôt cloné : il copie `audit.sh` vers `/usr/local/sbin/server-security-audit.sh`,
+`.env` vers `/etc/server-security-audit/.env`, et écrit les rapports dans
+`/var/lib/server-security-audit/reports/` — les trois en `root:root`,
+inaccessibles en écriture au compte qui a cloné le dépôt.
+
+**Pourquoi.** Le dépôt cloné (`$SCRIPT_DIR`) appartient typiquement à un
+compte non-root, et peut être monté en écriture dans un conteneur exposé
+publiquement (ex: un éditeur de fichiers). Le service tournant en root,
+quiconque peut écrire dans ce dossier peut remplacer `audit.sh` ou `.env`
+(`source`, donc exécution arbitraire) et obtenir root à l'heure du timer.
+Incident réel du 2026-09-21 : ce chemin a été rouvert par erreur une
+première fois (correction incomplète du script) avant d'être fermé ici,
+dans l'outil, plutôt qu'à la main sur chaque serveur.
+
+**Conséquences pratiques** :
+- `git pull` seul ne met plus à jour le comportement réel : relancer
+  `sudo ./install.sh` pour repropager `audit.sh`/`.env` vers leur copie
+  déployée.
+- `AUDIT_SOURCE_DIR` (mis dans l'unité par `install.sh`, vaut `$SCRIPT_DIR`)
+  permet au script de comparer sa copie déployée au dépôt source et de
+  vérifier l'état git de ce dépôt — section « Intégrité du dispositif
+  d'audit » du rapport.
+- Éditer `.env` : toujours dans le dépôt (`$SCRIPT_DIR/.env`), jamais
+  directement dans `/etc/server-security-audit/.env` — cette copie est
+  écrasée à chaque `install.sh`.
 
 ## Installer sur un nouveau serveur
 
